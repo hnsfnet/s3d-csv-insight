@@ -12,10 +12,39 @@ st.set_page_config(page_title="数据分析看板", page_icon="📊", layout="wi
 
 
 COLORS = ["#636EFA", "#EF553B", "#00CC96", "#AB63FA", "#FFA15A", "#19D3F3"]
+ENCODING_CANDIDATES = ["utf-8", "utf-8-sig", "gbk", "gb2312", "latin-1"]
+
+
+def read_csv_auto_encoding(file_obj):
+    raw_bytes = file_obj.read()
+    errors = []
+    for enc in ENCODING_CANDIDATES:
+        try:
+            buf = io.BytesIO(raw_bytes)
+            df = pd.read_csv(buf, encoding=enc)
+            return df, enc
+        except Exception as e:
+            errors.append(f"{enc}: {type(e).__name__} — {e}")
+    raise RuntimeError(
+        "所有候选编码均解析失败。\n已尝试的编码及错误：\n"
+        + "\n".join(f"  - {msg}" for msg in errors)
+        + "\n\n建议：请用 Excel 或文本编辑器将文件另存为 UTF-8 编码后再上传。"
+    )
 
 
 def detect_column_types(df):
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    numeric_cols_raw = df.select_dtypes(include=[np.number]).columns.tolist()
+    numeric_cols = []
+    low_cardinality_numeric = []
+    total_rows = len(df)
+    for col in numeric_cols_raw:
+        non_null = df[col].dropna()
+        nuniq = non_null.nunique()
+        if nuniq < 15 or (total_rows > 0 and nuniq < total_rows * 0.2):
+            low_cardinality_numeric.append(col)
+        else:
+            numeric_cols.append(col)
+
     date_cols = []
     remaining_object_cols = []
     for col in df.select_dtypes(include=["object"]).columns:
@@ -27,10 +56,18 @@ def detect_column_types(df):
                 remaining_object_cols.append(col)
         except Exception:
             remaining_object_cols.append(col)
-    categorical_cols = remaining_object_cols + df.select_dtypes(include=["category", "bool"]).columns.tolist()
+
+    categorical_cols = (
+        remaining_object_cols
+        + df.select_dtypes(include=["category", "bool"]).columns.tolist()
+        + low_cardinality_numeric
+    )
     for col in categorical_cols[:]:
-        if df[col].nunique() > df.shape[0] * 0.5 and df[col].nunique() > 20:
+        nunique = df[col].nunique(dropna=True)
+        if total_rows > 0 and nunique > total_rows * 0.5 and nunique > 20:
             categorical_cols.remove(col)
+
+    categorical_cols = list(dict.fromkeys(categorical_cols))
     return numeric_cols, categorical_cols, date_cols
 
 
@@ -185,26 +222,46 @@ def display_data_preview(df, title_prefix=""):
     st.dataframe(df.head(20), use_container_width=True, hide_index=True)
 
 
+def _safe_numeric_stats(series):
+    s = series.dropna()
+    if len(s) == 0:
+        return None, None, None, None, None
+    try:
+        return (
+            round(float(s.mean()), 4),
+            round(float(s.median()), 4),
+            round(float(s.std()), 4),
+            round(float(s.min()), 4),
+            round(float(s.max()), 4),
+        )
+    except (ValueError, TypeError, ZeroDivisionError):
+        return None, None, None, None, None
+
+
 def build_statistics_table(df, numeric_cols, categorical_cols):
     num_stats = []
     for col in numeric_cols:
         s = df[col]
+        mean_v, med_v, std_v, min_v, max_v = _safe_numeric_stats(s)
         num_stats.append({
             "列名": col,
-            "均值": round(s.mean(), 4) if s.notnull().any() else None,
-            "中位数": round(s.median(), 4) if s.notnull().any() else None,
-            "标准差": round(s.std(), 4) if s.notnull().any() else None,
-            "最小值": round(s.min(), 4) if s.notnull().any() else None,
-            "最大值": round(s.max(), 4) if s.notnull().any() else None,
+            "均值": mean_v,
+            "中位数": med_v,
+            "标准差": std_v,
+            "最小值": min_v,
+            "最大值": max_v,
             "缺失值": int(s.isnull().sum()),
         })
     cat_stats = []
     for col in categorical_cols:
         s = df[col]
-        vc = s.value_counts()
+        try:
+            vc = s.value_counts(dropna=True)
+        except Exception:
+            vc = pd.Series(dtype=int)
         cat_stats.append({
             "列名": col,
-            "唯一值": int(s.nunique()),
+            "唯一值": int(s.nunique(dropna=True)),
             "最高频": vc.index[0] if len(vc) else None,
             "最高频次数": int(vc.iloc[0]) if len(vc) else 0,
             "缺失值": int(s.isnull().sum()),
@@ -330,18 +387,20 @@ def build_compare_statistics(df1, df2, num_cols_1, cat_cols_1, num_cols_2, cat_c
         rows = []
         for col in common_num:
             s1, s2 = df1[col], df2[col]
+            m1_1, m1_2, m1_3, m1_4, m1_5 = _safe_numeric_stats(s1)
+            m2_1, m2_2, m2_3, m2_4, m2_5 = _safe_numeric_stats(s2)
             rows.append({
                 "列名": col,
-                f"均值 [{label1}]": round(s1.mean(), 4) if s1.notnull().any() else None,
-                f"均值 [{label2}]": round(s2.mean(), 4) if s2.notnull().any() else None,
-                f"中位数 [{label1}]": round(s1.median(), 4) if s1.notnull().any() else None,
-                f"中位数 [{label2}]": round(s2.median(), 4) if s2.notnull().any() else None,
-                f"标准差 [{label1}]": round(s1.std(), 4) if s1.notnull().any() else None,
-                f"标准差 [{label2}]": round(s2.std(), 4) if s2.notnull().any() else None,
-                f"最小 [{label1}]": round(s1.min(), 4) if s1.notnull().any() else None,
-                f"最小 [{label2}]": round(s2.min(), 4) if s2.notnull().any() else None,
-                f"最大 [{label1}]": round(s1.max(), 4) if s1.notnull().any() else None,
-                f"最大 [{label2}]": round(s2.max(), 4) if s2.notnull().any() else None,
+                f"均值 [{label1}]": m1_1,
+                f"均值 [{label2}]": m2_1,
+                f"中位数 [{label1}]": m1_2,
+                f"中位数 [{label2}]": m2_2,
+                f"标准差 [{label1}]": m1_3,
+                f"标准差 [{label2}]": m2_3,
+                f"最小 [{label1}]": m1_4,
+                f"最小 [{label2}]": m2_4,
+                f"最大 [{label1}]": m1_5,
+                f"最大 [{label2}]": m2_5,
             })
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
@@ -351,11 +410,14 @@ def build_compare_statistics(df1, df2, num_cols_1, cat_cols_1, num_cols_2, cat_c
         rows = []
         for col in common_cat:
             s1, s2 = df1[col], df2[col]
-            vc1, vc2 = s1.value_counts(), s2.value_counts()
+            try:
+                vc1, vc2 = s1.value_counts(dropna=True), s2.value_counts(dropna=True)
+            except Exception:
+                vc1, vc2 = pd.Series(dtype=int), pd.Series(dtype=int)
             rows.append({
                 "列名": col,
-                f"唯一值 [{label1}]": int(s1.nunique()),
-                f"唯一值 [{label2}]": int(s2.nunique()),
+                f"唯一值 [{label1}]": int(s1.nunique(dropna=True)),
+                f"唯一值 [{label2}]": int(s2.nunique(dropna=True)),
                 f"最高频 [{label1}]": vc1.index[0] if len(vc1) else None,
                 f"最高频 [{label2}]": vc2.index[0] if len(vc2) else None,
             })
@@ -478,11 +540,12 @@ def single_file_mode():
         return
 
     try:
-        df = pd.read_csv(uploaded_file)
+        df, used_enc = read_csv_auto_encoding(uploaded_file)
     except Exception as e:
-        st.error(f"读取 CSV 失败: {e}")
+        st.error(f"读取 CSV 失败:\n{e}")
         return
 
+    st.success(f"✅ 解析成功，使用编码: {used_enc.upper()}")
     numeric_cols, categorical_cols, date_cols = detect_column_types(df)
     filtered, active = build_filter_sidebar(df, numeric_cols, categorical_cols, date_cols, key_prefix="sf_")
 
@@ -515,11 +578,16 @@ def compare_mode():
         return
 
     try:
-        df1_raw = pd.read_csv(file1)
-        df2_raw = pd.read_csv(file2)
+        df1_raw, enc1 = read_csv_auto_encoding(file1)
+        df2_raw, enc2 = read_csv_auto_encoding(file2)
     except Exception as e:
-        st.error(f"读取失败: {e}")
+        st.error(f"读取失败:\n{e}")
         return
+
+    st.success(
+        f"✅ {label1} 使用编码: {enc1.upper()}　|　"
+        f"{label2} 使用编码: {enc2.upper()}"
+    )
 
     tab_mode = st.sidebar.radio("展示方式", ["并排", "仅对比"], index=0)
 
