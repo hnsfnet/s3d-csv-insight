@@ -1,163 +1,93 @@
-import pandas as pd
-import numpy as np
-import streamlit as st
-import plotly.express as px
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import itertools
 import io
+import pandas as pd
+import streamlit as st
+
+from data_loader import load_csv_file, CSVLoadError
+from stats import detect_column_types, build_statistics_table, build_compare_statistics, missing_summary
+from filters import apply_filters
+from charts import (
+    ChartGenerator,
+    HistogramStrategy,
+    BarChartStrategy,
+    ScatterStrategy,
+    LineChartStrategy,
+    CompareChartGenerator,
+    CompareHistogramStrategy,
+    CompareBarStrategy,
+    CompareScatterStrategy,
+    default_config,
+)
 
 
 st.set_page_config(page_title="数据分析看板", page_icon="📊", layout="wide")
 
 
-COLORS = ["#636EFA", "#EF553B", "#00CC96", "#AB63FA", "#FFA15A", "#19D3F3"]
-ENCODING_CANDIDATES = ["utf-8", "utf-8-sig", "gbk", "gb2312", "latin-1"]
+CFG = default_config()
 
 
-def read_csv_auto_encoding(file_obj):
-    raw_bytes = file_obj.read()
-    errors = []
-    for enc in ENCODING_CANDIDATES:
-        try:
-            buf = io.BytesIO(raw_bytes)
-            df = pd.read_csv(buf, encoding=enc)
-            return df, enc
-        except Exception as e:
-            errors.append(f"{enc}: {type(e).__name__} — {e}")
-    raise RuntimeError(
-        "所有候选编码均解析失败。\n已尝试的编码及错误：\n"
-        + "\n".join(f"  - {msg}" for msg in errors)
-        + "\n\n建议：请用 Excel 或文本编辑器将文件另存为 UTF-8 编码后再上传。"
-    )
+def _build_chart_generator() -> ChartGenerator:
+    gen = ChartGenerator(config=CFG)
+    gen.add_strategy(HistogramStrategy(config=CFG))
+    gen.add_strategy(BarChartStrategy(config=CFG))
+    gen.add_strategy(ScatterStrategy(config=CFG))
+    gen.add_strategy(LineChartStrategy(config=CFG))
+    return gen
 
 
-def detect_column_types(df):
-    numeric_cols_raw = df.select_dtypes(include=[np.number]).columns.tolist()
-    numeric_cols = []
-    low_cardinality_numeric = []
-    total_rows = len(df)
-    for col in numeric_cols_raw:
-        non_null = df[col].dropna()
-        nuniq = non_null.nunique()
-        if nuniq < 15 or (total_rows > 0 and nuniq < total_rows * 0.2):
-            low_cardinality_numeric.append(col)
+def _build_compare_generator(label1: str, label2: str) -> CompareChartGenerator:
+    gen = CompareChartGenerator(config=CFG)
+    gen.add_strategy(CompareHistogramStrategy(config=CFG, label1=label1, label2=label2))
+    gen.add_strategy(CompareBarStrategy(config=CFG, label1=label1, label2=label2))
+    gen.add_strategy(CompareScatterStrategy(config=CFG, label1=label1, label2=label2))
+    return gen
+
+
+def display_data_preview(df, title_prefix=""):
+    if title_prefix:
+        st.markdown(f"#### {title_prefix} 📋 数据预览")
+    else:
+        st.header("📋 数据预览")
+    info = missing_summary(df)
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("数据行数", f"{info['rows']:,}")
+    with c2:
+        st.metric("数据列数", info["columns"])
+    with c3:
+        st.metric("缺失值总数", f"{info['missing_total']:,}")
+    st.dataframe(df.head(20), use_container_width=True, hide_index=True)
+
+
+def display_statistics(df, col_types, title_prefix=""):
+    if title_prefix:
+        st.markdown(f"#### {title_prefix} 📈 统计摘要")
+    else:
+        st.header("📈 统计摘要")
+    num_df, cat_df = build_statistics_table(df, col_types)
+    if len(num_df) > 0:
+        if title_prefix:
+            st.caption("数值列统计")
         else:
-            numeric_cols.append(col)
+            st.subheader("数值列统计")
+        st.dataframe(num_df, use_container_width=True, hide_index=True)
+    if len(cat_df) > 0:
+        if title_prefix:
+            st.caption("分类列统计")
+        else:
+            st.subheader("分类列统计")
+        st.dataframe(cat_df, use_container_width=True, hide_index=True)
 
-    date_cols = []
-    remaining_object_cols = []
-    for col in df.select_dtypes(include=["object"]).columns:
-        try:
-            converted = pd.to_datetime(df[col], errors="coerce")
-            if converted.notnull().sum() >= max(10, len(df) * 0.5):
-                date_cols.append(col)
-            else:
-                remaining_object_cols.append(col)
-        except Exception:
-            remaining_object_cols.append(col)
 
-    categorical_cols = (
-        remaining_object_cols
-        + df.select_dtypes(include=["category", "bool"]).columns.tolist()
-        + low_cardinality_numeric
+def display_charts_section(df, col_types, figs_dict=None, key_prefix="", title_prefix=""):
+    if title_prefix:
+        st.markdown(f"#### {title_prefix} 📊 自动生成图表")
+    else:
+        st.header("📊 自动生成图表")
+    gen = _build_chart_generator()
+    gen.render_all(
+        df, col_types.numeric, col_types.categorical, col_types.date,
+        figs_dict=figs_dict, key_prefix=key_prefix, title_prefix=title_prefix,
     )
-    for col in categorical_cols[:]:
-        nunique = df[col].nunique(dropna=True)
-        if total_rows > 0 and nunique > total_rows * 0.5 and nunique > 20:
-            categorical_cols.remove(col)
-
-    categorical_cols = list(dict.fromkeys(categorical_cols))
-    return numeric_cols, categorical_cols, date_cols
-
-
-def build_filter_sidebar(df, numeric_cols, categorical_cols, date_cols, key_prefix=""):
-    st.sidebar.subheader("🔍 数据筛选")
-    filtered = df.copy()
-    active_filters = 0
-
-    if not numeric_cols and not categorical_cols and not date_cols:
-        st.sidebar.caption("无可筛选的列")
-        return filtered, active_filters
-
-    with st.sidebar.expander("数值列筛选", expanded=False):
-        for col in numeric_cols:
-            series = df[col].dropna()
-            if len(series) == 0:
-                continue
-            lo = float(series.min())
-            hi = float(series.max())
-            if lo == hi:
-                continue
-            step = (hi - lo) / 100 if (hi - lo) > 100 else None
-            sel = st.slider(
-                f"{col}",
-                min_value=lo,
-                max_value=hi,
-                value=(lo, hi),
-                step=step,
-                key=f"{key_prefix}num_{col}",
-            )
-            if sel != (lo, hi):
-                filtered = filtered[(filtered[col] >= sel[0]) & (filtered[col] <= sel[1])]
-                active_filters += 1
-
-    with st.sidebar.expander("分类列筛选", expanded=False):
-        for col in categorical_cols:
-            uniques = sorted(df[col].dropna().astype(str).unique().tolist())
-            if len(uniques) == 0 or len(uniques) > 200:
-                continue
-            selected = st.multiselect(
-                f"{col}（空=全选）",
-                options=uniques,
-                default=[],
-                key=f"{key_prefix}cat_{col}",
-            )
-            if selected:
-                filtered = filtered[filtered[col].astype(str).isin(selected)]
-                active_filters += 1
-
-    with st.sidebar.expander("日期列筛选", expanded=False):
-        for col in date_cols:
-            converted = pd.to_datetime(df[col], errors="coerce")
-            min_dt = converted.min().date() if converted.notnull().any() else None
-            max_dt = converted.max().date() if converted.notnull().any() else None
-            if min_dt is None or max_dt is None:
-                continue
-            sel = st.date_input(
-                f"{col}",
-                value=(min_dt, max_dt),
-                min_value=min_dt,
-                max_value=max_dt,
-                key=f"{key_prefix}date_{col}",
-            )
-            if isinstance(sel, (list, tuple)) and len(sel) == 2:
-                start, end = sel
-                start_ts = pd.Timestamp(start)
-                end_ts = pd.Timestamp(end) + pd.Timedelta(days=1)
-                before = len(filtered)
-                mask = (converted >= start_ts) & (converted < end_ts)
-                filtered = filtered[mask.values]
-                if len(filtered) != before:
-                    active_filters += 1
-
-    reset = st.sidebar.button("重置筛选", key=f"{key_prefix}reset_filter")
-    if reset:
-        for col in numeric_cols:
-            k = f"{key_prefix}num_{col}"
-            if k in st.session_state:
-                del st.session_state[k]
-        for col in categorical_cols:
-            k = f"{key_prefix}cat_{col}"
-            if k in st.session_state:
-                del st.session_state[k]
-        for col in date_cols:
-            k = f"{key_prefix}date_{col}"
-            if k in st.session_state:
-                del st.session_state[k]
-        st.rerun()
-
-    return filtered, active_filters
 
 
 def build_export_sidebar(filtered_df, all_figs_dict, key_prefix=""):
@@ -194,7 +124,10 @@ def build_export_sidebar(filtered_df, all_figs_dict, key_prefix=""):
         for name, fig in all_figs_dict.items():
             safe_name = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in name)[:80]
             try:
-                png_bytes = fig.to_image(format="png", scale=2, width=900, height=500)
+                png_bytes = fig.to_image(
+                    format="png", scale=CFG.png_scale,
+                    width=CFG.png_width, height=CFG.png_height,
+                )
                 st.sidebar.download_button(
                     f"PNG: {name[:28]}",
                     data=png_bytes,
@@ -207,324 +140,6 @@ def build_export_sidebar(filtered_df, all_figs_dict, key_prefix=""):
                 pass
 
 
-def display_data_preview(df, title_prefix=""):
-    if title_prefix:
-        st.markdown(f"#### {title_prefix} 📋 数据预览")
-    else:
-        st.header("📋 数据预览")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("数据行数", f"{df.shape[0]:,}")
-    with col2:
-        st.metric("数据列数", df.shape[1])
-    with col3:
-        st.metric("缺失值总数", f"{df.isnull().sum().sum():,}")
-    st.dataframe(df.head(20), use_container_width=True, hide_index=True)
-
-
-def _safe_numeric_stats(series):
-    s = series.dropna()
-    if len(s) == 0:
-        return None, None, None, None, None
-    try:
-        return (
-            round(float(s.mean()), 4),
-            round(float(s.median()), 4),
-            round(float(s.std()), 4),
-            round(float(s.min()), 4),
-            round(float(s.max()), 4),
-        )
-    except (ValueError, TypeError, ZeroDivisionError):
-        return None, None, None, None, None
-
-
-def build_statistics_table(df, numeric_cols, categorical_cols):
-    num_stats = []
-    for col in numeric_cols:
-        s = df[col]
-        mean_v, med_v, std_v, min_v, max_v = _safe_numeric_stats(s)
-        num_stats.append({
-            "列名": col,
-            "均值": mean_v,
-            "中位数": med_v,
-            "标准差": std_v,
-            "最小值": min_v,
-            "最大值": max_v,
-            "缺失值": int(s.isnull().sum()),
-        })
-    cat_stats = []
-    for col in categorical_cols:
-        s = df[col]
-        try:
-            vc = s.value_counts(dropna=True)
-        except Exception:
-            vc = pd.Series(dtype=int)
-        cat_stats.append({
-            "列名": col,
-            "唯一值": int(s.nunique(dropna=True)),
-            "最高频": vc.index[0] if len(vc) else None,
-            "最高频次数": int(vc.iloc[0]) if len(vc) else 0,
-            "缺失值": int(s.isnull().sum()),
-        })
-    return pd.DataFrame(num_stats), pd.DataFrame(cat_stats)
-
-
-def display_statistics(df, numeric_cols, categorical_cols, title_prefix=""):
-    if title_prefix:
-        st.markdown(f"#### {title_prefix} 📈 统计摘要")
-    else:
-        st.header("📈 统计摘要")
-    num_df, cat_df = build_statistics_table(df, numeric_cols, categorical_cols)
-    if numeric_cols:
-        if title_prefix:
-            st.caption("数值列统计")
-        else:
-            st.subheader("数值列统计")
-        st.dataframe(num_df, use_container_width=True, hide_index=True)
-    if categorical_cols:
-        if title_prefix:
-            st.caption("分类列统计")
-        else:
-            st.subheader("分类列统计")
-        st.dataframe(cat_df, use_container_width=True, hide_index=True)
-    return num_df, cat_df
-
-
-def build_histograms(df, numeric_cols, figs_dict, figs_key_prefix=""):
-    result = []
-    if not numeric_cols:
-        return result
-    n_cols = min(2, len(numeric_cols))
-    cols = st.columns(n_cols)
-    for idx, col_name in enumerate(numeric_cols):
-        with cols[idx % n_cols]:
-            series = df[col_name].dropna()
-            fig = px.histogram(
-                series, x=col_name, title=f"{col_name} 分布",
-                nbins=30, opacity=0.75,
-            )
-            fig.update_layout(height=400, margin=dict(l=20, r=20, t=40, b=20), showlegend=False)
-            fig.update_traces(marker_line_width=1, marker_line_color="white")
-            st.plotly_chart(fig, use_container_width=True)
-            result.append(fig)
-            if figs_dict is not None:
-                figs_dict[f"{figs_key_prefix}hist_{col_name}"] = fig
-    return result
-
-
-def build_bar_charts(df, categorical_cols, figs_dict, figs_key_prefix=""):
-    result = []
-    if not categorical_cols:
-        return result
-    n_cols = min(2, len(categorical_cols))
-    cols = st.columns(n_cols)
-    for idx, col_name in enumerate(categorical_cols):
-        with cols[idx % n_cols]:
-            vc = df[col_name].value_counts().head(15)
-            fig = px.bar(
-                x=vc.index, y=vc.values,
-                title=f"{col_name} 频次统计 (Top 15)",
-                labels={"x": col_name, "y": "频次"},
-            )
-            fig.update_layout(height=400, margin=dict(l=20, r=20, t=40, b=80), xaxis_tickangle=-45)
-            st.plotly_chart(fig, use_container_width=True)
-            result.append(fig)
-            if figs_dict is not None:
-                figs_dict[f"{figs_key_prefix}bar_{col_name}"] = fig
-    return result
-
-
-def build_scatter_plots(df, numeric_cols, figs_dict, figs_key_prefix=""):
-    result = []
-    if len(numeric_cols) < 2:
-        return result
-    pairs = list(itertools.combinations(numeric_cols, 2))
-    max_pairs = min(len(pairs), 6)
-    pairs = pairs[:max_pairs]
-    n_cols = min(2, len(pairs))
-    cols = st.columns(n_cols)
-    for idx, (x_col, y_col) in enumerate(pairs):
-        with cols[idx % n_cols]:
-            clean = df[[x_col, y_col]].dropna()
-            fig = px.scatter(
-                clean, x=x_col, y=y_col,
-                title=f"{x_col} vs {y_col}", opacity=0.6,
-            )
-            fig.update_layout(height=400, margin=dict(l=20, r=20, t=40, b=20))
-            st.plotly_chart(fig, use_container_width=True)
-            result.append(fig)
-            if figs_dict is not None:
-                figs_dict[f"{figs_key_prefix}scatter_{x_col}_{y_col}"] = fig
-    return result
-
-
-def display_charts(df, numeric_cols, categorical_cols, figs_dict=None, figs_key_prefix="", title_prefix=""):
-    if title_prefix:
-        st.markdown(f"#### {title_prefix} 📊 自动生成图表")
-    else:
-        st.header("📊 自动生成图表")
-    if title_prefix:
-        st.caption("数值列直方图")
-    else:
-        st.subheader("📊 数值列直方图")
-    build_histograms(df, numeric_cols, figs_dict, figs_key_prefix)
-    if title_prefix:
-        st.caption("分类列柱状图")
-    else:
-        st.subheader("📊 分类列柱状图")
-    build_bar_charts(df, categorical_cols, figs_dict, figs_key_prefix)
-    if title_prefix:
-        st.caption("数值列散点图")
-    else:
-        st.subheader("📊 数值列散点图")
-    build_scatter_plots(df, numeric_cols, figs_dict, figs_key_prefix)
-
-
-def build_compare_statistics(df1, df2, num_cols_1, cat_cols_1, num_cols_2, cat_cols_2, label1, label2):
-    common_num = sorted(set(num_cols_1) & set(num_cols_2))
-    if common_num:
-        st.subheader("数值列对比（同名列）")
-        rows = []
-        for col in common_num:
-            s1, s2 = df1[col], df2[col]
-            m1_1, m1_2, m1_3, m1_4, m1_5 = _safe_numeric_stats(s1)
-            m2_1, m2_2, m2_3, m2_4, m2_5 = _safe_numeric_stats(s2)
-            rows.append({
-                "列名": col,
-                f"均值 [{label1}]": m1_1,
-                f"均值 [{label2}]": m2_1,
-                f"中位数 [{label1}]": m1_2,
-                f"中位数 [{label2}]": m2_2,
-                f"标准差 [{label1}]": m1_3,
-                f"标准差 [{label2}]": m2_3,
-                f"最小 [{label1}]": m1_4,
-                f"最小 [{label2}]": m2_4,
-                f"最大 [{label1}]": m1_5,
-                f"最大 [{label2}]": m2_5,
-            })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-    common_cat = sorted(set(cat_cols_1) & set(cat_cols_2))
-    if common_cat:
-        st.subheader("分类列对比（同名列）")
-        rows = []
-        for col in common_cat:
-            s1, s2 = df1[col], df2[col]
-            try:
-                vc1, vc2 = s1.value_counts(dropna=True), s2.value_counts(dropna=True)
-            except Exception:
-                vc1, vc2 = pd.Series(dtype=int), pd.Series(dtype=int)
-            rows.append({
-                "列名": col,
-                f"唯一值 [{label1}]": int(s1.nunique(dropna=True)),
-                f"唯一值 [{label2}]": int(s2.nunique(dropna=True)),
-                f"最高频 [{label1}]": vc1.index[0] if len(vc1) else None,
-                f"最高频 [{label2}]": vc2.index[0] if len(vc2) else None,
-            })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-
-def build_compare_histograms(df1, df2, numeric_cols_1, numeric_cols_2, label1, label2, figs_dict):
-    common = sorted(set(numeric_cols_1) & set(numeric_cols_2))
-    if not common:
-        return
-    st.subheader("叠加直方图（同名列）")
-    n_cols = min(2, len(common))
-    cols = st.columns(n_cols)
-    for idx, col in enumerate(common):
-        with cols[idx % n_cols]:
-            fig = go.Figure()
-            fig.add_trace(go.Histogram(
-                x=df1[col].dropna(), name=label1, nbinsx=30,
-                marker_color=COLORS[0], opacity=0.65,
-            ))
-            fig.add_trace(go.Histogram(
-                x=df2[col].dropna(), name=label2, nbinsx=30,
-                marker_color=COLORS[1], opacity=0.65,
-            ))
-            fig.update_layout(
-                barmode="overlay", title=f"{col} 分布对比",
-                height=400, margin=dict(l=20, r=20, t=40, b=20),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02),
-            )
-            st.plotly_chart(fig, use_container_width=True)
-            figs_dict[f"cmp_hist_{col}"] = fig
-
-
-def build_compare_bars(df1, df2, cat_cols_1, cat_cols_2, label1, label2, figs_dict):
-    common = sorted(set(cat_cols_1) & set(cat_cols_2))
-    if not common:
-        return
-    st.subheader("叠加柱状图（同名列，Top 10）")
-    n_cols = min(2, len(common))
-    cols = st.columns(n_cols)
-    for idx, col in enumerate(common):
-        with cols[idx % n_cols]:
-            vc1 = df1[col].value_counts().head(10)
-            vc2 = df2[col].value_counts().head(10)
-            union = sorted(set(vc1.index) | set(vc2.index), key=lambda x: -(vc1.get(x, 0) + vc2.get(x, 0)))
-            union = union[:10]
-            fig = go.Figure()
-            fig.add_trace(go.Bar(
-                x=[str(u) for u in union],
-                y=[vc1.get(u, 0) for u in union],
-                name=label1, marker_color=COLORS[0],
-            ))
-            fig.add_trace(go.Bar(
-                x=[str(u) for u in union],
-                y=[vc2.get(u, 0) for u in union],
-                name=label2, marker_color=COLORS[1],
-            ))
-            fig.update_layout(
-                barmode="group", title=f"{col} 频次对比",
-                height=400, margin=dict(l=20, r=20, t=40, b=80),
-                xaxis_tickangle=-45,
-                legend=dict(orientation="h", yanchor="bottom", y=1.02),
-            )
-            st.plotly_chart(fig, use_container_width=True)
-            figs_dict[f"cmp_bar_{col}"] = fig
-
-
-def build_compare_scatters(df1, df2, num_cols_1, num_cols_2, label1, label2, figs_dict):
-    common = sorted(set(num_cols_1) & set(num_cols_2))
-    if len(common) < 2:
-        return
-    pairs = list(itertools.combinations(common, 2))[:6]
-    if not pairs:
-        return
-    st.subheader("叠加散点图（同名列）")
-    n_cols = min(2, len(pairs))
-    cols = st.columns(n_cols)
-    for idx, (x_col, y_col) in enumerate(pairs):
-        with cols[idx % n_cols]:
-            fig = go.Figure()
-            clean1 = df1[[x_col, y_col]].dropna()
-            clean2 = df2[[x_col, y_col]].dropna()
-            fig.add_trace(go.Scatter(
-                x=clean1[x_col], y=clean1[y_col], mode="markers",
-                name=label1, marker=dict(color=COLORS[0], opacity=0.5),
-            ))
-            fig.add_trace(go.Scatter(
-                x=clean2[x_col], y=clean2[y_col], mode="markers",
-                name=label2, marker=dict(color=COLORS[1], opacity=0.5),
-            ))
-            fig.update_layout(
-                title=f"{x_col} vs {y_col}",
-                height=400, margin=dict(l=20, r=20, t=40, b=20),
-                xaxis_title=x_col, yaxis_title=y_col,
-                legend=dict(orientation="h", yanchor="bottom", y=1.02),
-            )
-            st.plotly_chart(fig, use_container_width=True)
-            figs_dict[f"cmp_scatter_{x_col}_{y_col}"] = fig
-
-
-def display_compare_charts(df1, df2, num1, cat1, num2, cat2, label1, label2, figs_dict):
-    st.header("🆚 对比图表")
-    build_compare_histograms(df1, df2, num1, num2, label1, label2, figs_dict)
-    build_compare_bars(df1, df2, cat1, cat2, label1, label2, figs_dict)
-    build_compare_scatters(df1, df2, num1, num2, label1, label2, figs_dict)
-
-
 def single_file_mode():
     st.title("📊 数据分析看板")
     uploaded_file = st.file_uploader("请上传 CSV 文件", type=["csv"])
@@ -535,19 +150,24 @@ def single_file_mode():
             - **筛选**: 左侧边栏按数值范围、分类多选、日期范围筛选
             - **导出**: 侧边栏可导出 CSV / Excel，及各图表 PNG
             - **统计**: 自动显示数值列和分类列统计摘要
-            - **图表**: 数值直方图、分类柱状图、散点图（相关性）
+            - **图表**: 数值直方图、分类柱状图、散点图、日期趋势图
             """)
         return
 
     try:
-        df, used_enc = read_csv_auto_encoding(uploaded_file)
-    except Exception as e:
+        df, used_enc = load_csv_file(uploaded_file)
+    except CSVLoadError as e:
         st.error(f"读取 CSV 失败:\n{e}")
+        return
+    except Exception as e:
+        st.error(f"读取 CSV 失败: {e}")
         return
 
     st.success(f"✅ 解析成功，使用编码: {used_enc.upper()}")
-    numeric_cols, categorical_cols, date_cols = detect_column_types(df)
-    filtered, active = build_filter_sidebar(df, numeric_cols, categorical_cols, date_cols, key_prefix="sf_")
+    col_types = detect_column_types(df)
+    filter_result = apply_filters(df, col_types, key_prefix="sf_")
+    filtered = filter_result.df
+    active = filter_result.active_count
 
     if active > 0:
         st.info(f"🔍 已应用 {active} 个筛选条件: {len(df):,} → {len(filtered):,} 行")
@@ -557,8 +177,8 @@ def single_file_mode():
 
     figs_dict = {}
     display_data_preview(filtered)
-    display_statistics(filtered, numeric_cols, categorical_cols)
-    display_charts(filtered, numeric_cols, categorical_cols, figs_dict=figs_dict, figs_key_prefix="sf_")
+    display_statistics(filtered, col_types)
+    display_charts_section(filtered, col_types, figs_dict=figs_dict, key_prefix="sf_")
     build_export_sidebar(filtered, figs_dict, key_prefix="sf_")
 
 
@@ -578,44 +198,47 @@ def compare_mode():
         return
 
     try:
-        df1_raw, enc1 = read_csv_auto_encoding(file1)
-        df2_raw, enc2 = read_csv_auto_encoding(file2)
-    except Exception as e:
+        df1_raw, enc1 = load_csv_file(file1)
+        df2_raw, enc2 = load_csv_file(file2)
+    except CSVLoadError as e:
         st.error(f"读取失败:\n{e}")
         return
+    except Exception as e:
+        st.error(f"读取失败: {e}")
+        return
 
-    st.success(
-        f"✅ {label1} 使用编码: {enc1.upper()}　|　"
-        f"{label2} 使用编码: {enc2.upper()}"
-    )
+    st.success(f"✅ {label1} 使用编码: {enc1.upper()}　|　{label2} 使用编码: {enc2.upper()}")
 
     tab_mode = st.sidebar.radio("展示方式", ["并排", "仅对比"], index=0)
 
-    n1, c1, d1 = detect_column_types(df1_raw)
-    n2, c2, d2 = detect_column_types(df2_raw)
+    col_types1_raw = detect_column_types(df1_raw)
+    col_types2_raw = detect_column_types(df2_raw)
 
     st.sidebar.markdown("---")
     st.sidebar.subheader(f"🎯 {label1} 筛选")
-    df1, a1 = build_filter_sidebar(df1_raw, n1, c1, d1, key_prefix="cmp1_")
-    if a1 > 0:
+    fr1 = apply_filters(df1_raw, col_types1_raw, key_prefix="cmp1_")
+    df1 = fr1.df
+    if fr1.active_count > 0:
         st.sidebar.caption(f"{label1}: {len(df1_raw):,} → {len(df1):,} 行")
 
     st.sidebar.markdown("---")
     st.sidebar.subheader(f"🎯 {label2} 筛选")
-    df2, a2 = build_filter_sidebar(df2_raw, n2, c2, d2, key_prefix="cmp2_")
-    if a2 > 0:
+    fr2 = apply_filters(df2_raw, col_types2_raw, key_prefix="cmp2_")
+    df2 = fr2.df
+    if fr2.active_count > 0:
         st.sidebar.caption(f"{label2}: {len(df2_raw):,} → {len(df2):,} 行")
 
     if len(df1) == 0 or len(df2) == 0:
         st.warning("筛选后至少一个文件为空，请调整条件")
         return
 
+    col_types1 = detect_column_types(df1)
+    col_types2 = detect_column_types(df2)
+
     figs_dict = {}
-    n1, c1, d1 = detect_column_types(df1)
-    n2, c2, d2 = detect_column_types(df2)
 
     if tab_mode == "并排":
-        st.header(f"📋 数据预览对比")
+        st.header("📋 数据预览对比")
         p1, p2 = st.columns(2)
         with p1:
             st.markdown(f"**{label1}** ({len(df1):,} 行 × {len(df1.columns)} 列)")
@@ -624,23 +247,34 @@ def compare_mode():
             st.markdown(f"**{label2}** ({len(df2):,} 行 × {len(df2.columns)} 列)")
             st.dataframe(df2.head(15), use_container_width=True, hide_index=True)
 
-        st.header(f"📈 统计摘要对比")
+        st.header("📈 统计摘要对比")
         s1, s2 = st.columns(2)
         with s1:
-            display_statistics(df1, n1, c1, title_prefix=label1)
+            display_statistics(df1, col_types1, title_prefix=label1)
         with s2:
-            display_statistics(df2, n2, c2, title_prefix=label2)
+            display_statistics(df2, col_types2, title_prefix=label2)
 
-        st.header(f"📊 各自图表")
+        st.header("📊 各自图表")
         g1, g2 = st.columns(2)
         with g1:
-            display_charts(df1, n1, c1, figs_dict=figs_dict, figs_key_prefix="c1_", title_prefix=label1)
+            display_charts_section(df1, col_types1, figs_dict=figs_dict, key_prefix="c1_", title_prefix=label1)
         with g2:
-            display_charts(df2, n2, c2, figs_dict=figs_dict, figs_key_prefix="c2_", title_prefix=label2)
+            display_charts_section(df2, col_types2, figs_dict=figs_dict, key_prefix="c2_", title_prefix=label2)
 
     st.header("📊 同名列统计对比")
-    build_compare_statistics(df1, df2, n1, c1, n2, c2, label1, label2)
-    display_compare_charts(df1, df2, n1, c1, n2, c2, label1, label2, figs_dict)
+    num_cmp_df, cat_cmp_df = build_compare_statistics(
+        df1, df2, col_types1, col_types2, label1, label2,
+    )
+    if len(num_cmp_df) > 0:
+        st.subheader("数值列对比（同名列）")
+        st.dataframe(num_cmp_df, use_container_width=True, hide_index=True)
+    if len(cat_cmp_df) > 0:
+        st.subheader("分类列对比（同名列）")
+        st.dataframe(cat_cmp_df, use_container_width=True, hide_index=True)
+
+    st.header("🆚 对比图表")
+    cmp_gen = _build_compare_generator(label1, label2)
+    cmp_gen.render_all(df1, df2, col_types1, col_types2, figs_dict=figs_dict, key_prefix="cmp_")
 
     st.sidebar.markdown("---")
     build_export_sidebar(df1, figs_dict, key_prefix="c1_exp_")
