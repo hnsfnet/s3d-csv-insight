@@ -1,3 +1,8 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
 import pandas as pd
 import streamlit as st
 
@@ -7,10 +12,24 @@ from stats import ColumnTypes
 CATEGORICAL_MAX_UNIQUE = 200
 
 
+@dataclass
+class FilterConditions:
+    numeric_ranges: Dict[str, Tuple[float, float]] = field(default_factory=dict)
+    categorical_selected: Dict[str, List[str]] = field(default_factory=dict)
+    date_ranges: Dict[str, Tuple[pd.Timestamp, pd.Timestamp]] = field(default_factory=dict)
+
+    def is_active(self) -> int:
+        return (
+            len(self.numeric_ranges)
+            + len(self.categorical_selected)
+            + len(self.date_ranges)
+        )
+
+
+@dataclass
 class FilterResult:
-    def __init__(self, df: pd.DataFrame, active_count: int):
-        self.df = df
-        self.active_count = active_count
+    df: pd.DataFrame
+    active_count: int
 
 
 def _make_key(prefix: str, kind: str, col: str) -> str:
@@ -30,6 +49,60 @@ def _clear_filter_keys(numeric_cols, categorical_cols, date_cols, key_prefix):
         k = _make_key(key_prefix, "date", col)
         if k in st.session_state:
             del st.session_state[k]
+
+
+def apply_numeric_filter(series: pd.Series, col: str, bounds: Optional[Tuple[float, float]]) -> pd.Series:
+    if bounds is None:
+        return pd.Series(True, index=series.index)
+    lo, hi = bounds
+    return (series >= lo) & (series <= hi)
+
+
+def apply_categorical_filter(series: pd.Series, col: str, selected: Optional[List[str]]) -> pd.Series:
+    if not selected:
+        return pd.Series(True, index=series.index)
+    return series.astype(str).isin(selected)
+
+
+def apply_date_filter(series: pd.Series, col: str, bounds: Optional[Tuple[pd.Timestamp, pd.Timestamp]]) -> pd.Series:
+    if bounds is None:
+        return pd.Series(True, index=series.index)
+    converted = pd.to_datetime(series, errors="coerce")
+    start, end = bounds
+    return (converted >= start) & (converted < end)
+
+
+def apply_filter_conditions(df: pd.DataFrame, col_types: ColumnTypes, conditions: FilterConditions) -> FilterResult:
+    filtered = df.copy()
+    for col, bounds in conditions.numeric_ranges.items():
+        if col not in df.columns:
+            continue
+        lo, hi = bounds
+        series = df[col]
+        original = series.dropna()
+        if len(original) == 0:
+            continue
+        default_lo = float(original.min())
+        default_hi = float(original.max())
+        if (lo, hi) == (default_lo, default_hi):
+            continue
+        filtered = filtered[(filtered[col] >= lo) & (filtered[col] <= hi)]
+
+    for col, selected in conditions.categorical_selected.items():
+        if col not in df.columns or not selected:
+            continue
+        filtered = filtered[filtered[col].astype(str).isin(selected)]
+
+    for col, bounds in conditions.date_ranges.items():
+        if col not in df.columns:
+            continue
+        start, end = bounds
+        converted = pd.to_datetime(df[col], errors="coerce")
+        mask = (converted >= start) & (converted < end)
+        filtered = filtered[mask]
+
+    active = conditions.is_active()
+    return FilterResult(df=filtered, active_count=active)
 
 
 def apply_filters(
